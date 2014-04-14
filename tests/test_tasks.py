@@ -27,6 +27,21 @@ class TestCase(unittest.TestCase):
         assert tasks.uuidfromurl(url) == 'd77b42a800ce66d2018e30ff181d508daf3f821b'
 
 
+    def test_extensionfromurl(self):
+        """Test uuidfromurl()"""
+        url = 'http://opengameart.org/content/fieldstone-fireplace'
+
+        assert tasks.extensionfromurl(url) == ''
+        
+        url = 'http://opengameart.org/sites/default/files/fireplace_fieldstone.blend.zip'
+
+        assert tasks.extensionfromurl(url) == '.zip'
+        
+        url = 'http://opengameart.org/sites/default/files/van.blend'
+
+        assert tasks.extensionfromurl(url) == '.blend'
+        
+
     def test_download(self):
         """Test download()"""
         url = 'http://opengameart.org/content/fieldstone-fireplace'
@@ -67,7 +82,8 @@ class TestCase(unittest.TestCase):
 
     def test_analyze(self):
         """Test parse()"""
-        url = 'http://opengameart.org/sites/default/files/fireplace_fieldstone.blend.zip'
+        #url = 'http://opengameart.org/sites/default/files/fireplace_fieldstone.blend.zip'
+        url = 'http://opengameart.org/sites/default/files/van.blend'
         
         result = tasks.download.s(url).apply()
         file_path = result.get()

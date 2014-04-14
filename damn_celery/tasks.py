@@ -39,7 +39,17 @@ def uuidfromurl(url):
     """
     m = hashlib.sha1(url)
     return m.hexdigest()
-    
+
+
+def extensionfromurl(url):
+    """
+    Extract the extension from an url
+    """
+    from urlparse import urlparse
+    parsed_uri = urlparse(url)
+    root, ext = os.path.splitext(parsed_uri.path)
+    return ext
+
 
 def has_completed(job_id):
     """
@@ -53,28 +63,43 @@ def collect_stats(job_id):
     """
     Collect statistics about the given OGA job.
     """
+    import json
+    from thrift.protocol.TJSONProtocol import TSimpleJSONProtocol
+    from damn_at.serialization import SerializeThriftMsg
+    
     data = {}
     
+    parent = AsyncResult(job_id)
+    data['state'] = parent.state
+    
     parse_url = AsyncResult(job_id+'_parse_url')
-    data['state'] = parse_url.state
+    data['parse_url_state'] = parse_url.state
     data['jobs'] = []
+    data['completed'] = []
     dmap = AsyncResult(job_id+'_dmap')
+    data['dmap_state'] = parse_url.state
     info = dmap.info
     total = 0
     if info:
         for child in info.get('__subtasks', []):
             total += 1
-            if type(child) != type({}):
-                data['jobs'].append(child.info)
-            else:
+            if type(child) == type({}):
                 if 'status' in child:
                     data['jobs'].append(child)
+                else:
+                    data['completed'].extend(child.values())
+            elif hasattr(child, 'info'):
+                data['jobs'].append(child.info)
+            else:
+                data['jobs'].append(str(child))
     
-    if dmap.state != 'SUCCESS' and parse_url.state == 'SUCCESS':
+    if len(data['jobs']) and parent.state == 'SUCCESS':
         data['state'] = 'PROCESSING'
     
     data['current'] = total - len(data['jobs'])
     data['total'] = total
+    
+    data['completed'] = [json.loads(SerializeThriftMsg(descr, TSimpleJSONProtocol)) if hasattr(descr, 'validate') else str(descr) for descr in data['completed']]
     
     return data, has_completed(job_id)
 
@@ -167,7 +192,10 @@ def download(self, url):
     """
     logger.debug('Tasks::download %s -> %s', str(url), str(self.request.id))
     
-    path = os.path.join('/tmp/oga', uuidfromurl(url))
+    path = os.path.join('/tmp/oga', uuidfromurl(url) + extensionfromurl(url))
+    
+    logger.warning('Tasks::download %s to %s', str(url), str(path))
+    
     if not os.path.exists(os.path.dirname(path)):
         os.makedirs(os.path.dirname(path))
     if not os.path.exists(path):
@@ -254,7 +282,7 @@ def analyze(self, file_path):
 
 
 @app.task(bind=True)
-def transcode(self, file_descr, asset_id, dst_mimetype='image/png', options={}):
+def transcode(self, file_descr, asset_id, dst_mimetype='image/png', options={}, path='/tmp/transcoded/'):
     """
     Transcode the given asset_id to the destination mimetype
     and return the paths to the transcoded files.
@@ -262,10 +290,9 @@ def transcode(self, file_descr, asset_id, dst_mimetype='image/png', options={}):
     logger.info('transcode: %s -> %s', str(asset_id), dst_mimetype)   
     
     from damn_at import Transcoder
-    path = '/tmp/transcoded/'
     t = Transcoder(path)    
     
-    preview_paths = []
+    preview_paths = {}
     
     
     target_mimetype = t.get_target_mimetype(asset_id.mimetype, dst_mimetype)
@@ -278,12 +305,14 @@ def transcode(self, file_descr, asset_id, dst_mimetype='image/png', options={}):
             print paths, exists
             if not exists:
                 #print('Transcoding', asset_id.subname, file_descr.file.filename)
-                paths = t.transcode(file_descr, asset_id, dst_mimetype, **options)
+                t.transcode(file_descr, asset_id, dst_mimetype, **options)
             #print('get_paths', asset_id.mimetype, paths)
-            preview_paths.append((size.replace(',', 'x'), paths, ))
+            preview_paths[size.replace(',', 'x')] = paths
+            preview_paths['exists-'+size.replace(',', 'x')] = map(lambda x: os.path.exists(os.path.join(path, x)), paths)
     else:
         #print(t.get_target_mimetypes().keys())
         print('get_paths FAILED', asset_id.mimetype, dst_mimetype)
+        raise Exception('No such transcoder %s - %s'%(asset_id.mimetype, dst_mimetype))
          
     return preview_paths
 
@@ -344,21 +373,20 @@ def oga(url, task_id=uuid()):
     """
     print('Tasks::oga', task_id)
     urls = chain(parse_url.s(url).set(task_id=task_id+'_parse_url', link_error=error_handler.s(task_id=task_id)), 
-                 dmap.s(process_url.s()).set(task_id=task_id+'_dmap', link_error=error_handler.s(task_id=task_id)),
+                 dmap.s(process_url.s().set(link_error=error_handler.s(task_id=task_id))).set(task_id=task_id+'_dmap'),
                  collect.s()
                  )
-    return urls.apply_async(task_id=task_id)
+    job = urls.apply_async(task_id=task_id)
+    
+    app.backend.store_result(job.id, {}, 'QUEUED')
+    return job
     
     
-def generate_previews_for_filedescriptions(file_descrs, task_id=uuid()):
+def generate_preview(*arg, **kwargs):
     """
-    Generate a webpreview for each asset contained in the given FileDescriptions.
+    Generate a webpreview
     """
-    callbacks = []
-    for file_descr in file_descrs:
-        for asset in file_descr.assets:
-            callbacks.append(transcode.s(file_descr, asset.asset))
-    paths = group(callbacks)
-    async_group = paths.apply_async(task_id=task_id)
-    async_group.save()
-    return async_group
+    task_id = kwargs.get('task_id', uuid())
+    job = transcode.s().set(task_id=task_id, link_error=error_handler.s(task_id=task_id)).apply_async(*arg, **kwargs)
+    app.backend.store_result(task_id, {}, 'QUEUED')
+    return job
